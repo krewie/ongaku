@@ -1,0 +1,1 @@
+int ongaku_play(const char *path, float volume);

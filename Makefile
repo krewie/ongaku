@@ -11,7 +11,7 @@ INCLUDE_DIR = include
 
 # Sources and objects 
 
-SRCS = $(SRC_DIR)/ongaku.c $(SRC_DIR)/ringbuffer.c
+SRCS = $(SRC_DIR)/ongaku.c $(SRC_DIR)/ringbuffer.c $(SRC_DIR)/main.c
 OBJS = $(SRCS:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 
 # Output binary

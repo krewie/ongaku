@@ -1,23 +1,19 @@
+#include "ongaku.h"
 #define DR_FLAC_IMPLEMENTATION
 #include "dr_flac.h"
-
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
-
 #include "ringbuffer.h"
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
 #include <pthread.h>
 #include <time.h>
-
 #include <termios.h>
 #include <unistd.h>
 
 static struct termios g_orig;
-
 static void enable_raw(void) {
     struct termios raw;
     tcgetattr(STDIN_FILENO, &g_orig);
@@ -27,11 +23,9 @@ static void enable_raw(void) {
     raw.c_cc[VTIME] = 0;
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
 }
-
 static void disable_raw(void) {
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_orig);
 }
-
 
 typedef struct {
     drflac*       flac;         // streaming decoder
@@ -118,53 +112,31 @@ static void data_callback(ma_device* dev, void* out, const void* in, ma_uint32 f
   }
 }
 
-/* -------------------- Main -------------------- */
-int main(int argc, char** argv) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage: %s song.flac [volume 0.0-1.0]\n", argv[0]);
-        return 1;
-    }
-    int isHelp = strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0;
-    if (argc == 2 && isHelp) {
-        printf("Usage: %s song.flac [volume 0.0-1.0]\n", argv[0]);
-        printf("Shortcuts: \n");
-        printf("j: seek -5s\n");
-        printf("k: play/pause\n");
-        printf("l:, seek +5s\n");
-        return 0;
-    }
-
-    const char* path  = argv[1];
-    float volume = (argc >= 3) ? (float)atof(argv[2]) : 1.0f;
-
+/* -------------------- Ongaku Player -------------------- */
+int ongaku_play(const char* path, float volume) {
+    // Open FLAC
     drflac* flac = drflac_open_file(path, NULL);
     if (!flac) { fprintf(stderr, "Failed to open FLAC: %s\n", path); return 1; }
 
-    /* Print file info */
+    // print file info
     double durationSec = (double)flac->totalPCMFrameCount / flac->sampleRate;
-    int minutes = (int)(durationSec / 60);
-    int seconds = (int)durationSec % 60;
+    int minutes = (int)(durationSec / 60), seconds = (int)durationSec % 60;
+    printf("\nFile: %s\n  Channels: %u  SampleRate: %u Hz  BitDepth: %u\n  Frames: %llu  Length: %d:%02d (%.1f s)\n",
+           path, flac->channels, flac->sampleRate, flac->bitsPerSample,
+           (unsigned long long)flac->totalPCMFrameCount, minutes, seconds, durationSec);
+    puts("--------------------------------------");
 
-    printf("File: %s\n", path);
-    printf("  Channels   : %u\n", flac->channels);
-    printf("  SampleRate : %u Hz\n", flac->sampleRate);
-    printf("  BitDepth   : %u\n", flac->bitsPerSample);
-    printf("  Frames     : %llu\n", (unsigned long long)flac->totalPCMFrameCount);
-    printf("  Length     : %d:%02d (%.1f sec)\n", minutes, seconds, durationSec);
-    printf("--------------------------------------\n");
-
-    /* Fill player state */
+    // ==== PLAYER STATE ====
     Player pl = {0};
     pl.flac   = flac;
     pl.volume = (volume < 0.f) ? 0.f : (volume > 1.f ? 1.f : volume);
-    atomic_init(&pl.finished,      0);
-    atomic_init(&pl.paused,        0);
-    atomic_init(&pl.seek_pending,  0);
-    atomic_init(&pl.muted,         0);
-    pl.running = 1;
-    pl.eof     = 0;
+    atomic_init(&pl.finished, 0);
+    atomic_init(&pl.paused,   0);
+    atomic_init(&pl.seek_pending, 0);
+    atomic_init(&pl.muted,        0);
+    pl.running = 1; pl.eof = 0;
 
-    /* Configure + init device */
+    // ==== DEVICE ====
     ma_device_config cfg = ma_device_config_init(ma_device_type_playback);
     cfg.playback.format   = ma_format_f32;
     cfg.playback.channels = (ma_uint32)flac->channels;
@@ -178,91 +150,76 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    /* Init ring buffer with ~2 seconds of audio */
-    size_t framesCap = (size_t)pl.device.sampleRate * 2; // 2s cushion
+    // ==== RING BUFFER ====
+    size_t framesCap = (size_t)pl.device.sampleRate * 2; // ~2s
     if (ring_init(&pl.rb, framesCap, pl.device.playback.channels) != 0) {
-        fprintf(stderr, "ring buffer init failed\n");
-        ma_device_uninit(&pl.device);
-        drflac_close(flac);
-        return 1;
+      fprintf(stderr, "ring buffer init failed\n");
+      ma_device_uninit(&pl.device); drflac_close(flac);
+      return 1;
     }
+    pl.prebuffer_frames = pl.device.sampleRate / 2; // ~0.5s before unmute
 
-    /* Start decode thread before audio */
+    // ==== DECODE THREAD ====
     if (pthread_create(&pl.th, NULL, decode_thread, &pl) != 0) {
         fprintf(stderr, "decode thread create failed\n");
-        ring_free(&pl.rb);
-        ma_device_uninit(&pl.device);
-        drflac_close(flac);
+        ring_free(&pl.rb); ma_device_uninit(&pl.device); drflac_close(flac);
         return 1;
     }
 
-    /* Prefill before starting audio (and mute while filling) */
+    // ==== PREFILL & START ====
     atomic_store(&pl.muted, 1);
     while (ring_available(&pl.rb) < pl.prebuffer_frames) {
-        struct timespec ts = {0, 3*1000*1000}; // 3 ms
-        nanosleep(&ts, NULL);
+        struct timespec ts = {0, 3*1000*1000}; nanosleep(&ts, NULL);
     }
     atomic_store(&pl.muted, 0);
 
     if (ma_device_start(&pl.device) != MA_SUCCESS) {
         fprintf(stderr, "Failed to start device.\n");
-        pl.running = 0;
-        pthread_join(pl.th, NULL);
-        ring_free(&pl.rb);
-        ma_device_uninit(&pl.device);
-        drflac_close(flac);
+        pl.running = 0; pthread_join(pl.th, NULL);
+        ring_free(&pl.rb); ma_device_uninit(&pl.device); drflac_close(flac);
         return 1;
     }
 
-    /* Simple wait loop with elapsed time */
+    // UI LOOP (j/l/k/q)
     enable_raw();
-
     while (!atomic_load(&pl.finished)) {
-        // print status
+        // status
         double elapsed = (double)pl.playedFrames / flac->sampleRate;
         size_t avail   = ring_available(&pl.rb);
         double pct     = 100.0 * (double)avail / (double)pl.rb.capacity;
 
-        printf("\r%02d:%02d  Buf:%5.1f%%  %s",
-               (int)(elapsed/60), (int)elapsed % 60,
-               pct,
-               atomic_load(&pl.paused) ? "[PAUSED]" :
-               (atomic_load(&pl.muted) ? "[SEEK]" : "      "));
+        printf("\r%02d:%02d  Buf:%5.1f%%\tVol: %5.2f\t%s",
+            (int)(elapsed/60), (int)elapsed % 60, pct, pl.volume,
+            atomic_load(&pl.paused) ? "[PAUSED]" :
+            (atomic_load(&pl.muted)  ? "[SEEK]"   : "      "));
         fflush(stdout);
 
-        // non-blocking key read
         char c;
         if (read(STDIN_FILENO, &c, 1) == 1) {
-            if (c == 'q') break;             // quit
-            if (c == 'k') {                  // toggle pause
-                int p = atomic_load(&pl.paused);
-                atomic_store(&pl.paused, !p);
-            }
-            if (c == 'j' || c == 'l') {      // seek -/+ 5s
-                double nowSec = (double)pl.playedFrames / pl.flac->sampleRate;
-                double toSec  = nowSec + (c=='l' ? +5.0 : -5.0);
-                if (toSec < 0) toSec = 0.0;
-                drflac_uint64 tgt = (drflac_uint64)(toSec * pl.flac->sampleRate);
+            if (c == 'q') { atomic_store(&pl.finished, 1); break; }
+            if (c == 'k') { int p = atomic_load(&pl.paused); atomic_store(&pl.paused, !p); }
+            if (c == 'n') { pl.volume -= 0.01; }
+            if (c == 'm') { pl.volume += 0.01; }
+            if (c == 'j' || c == 'l') {
+                double now = (double)pl.playedFrames / flac->sampleRate;
+                double to  = now + (c=='l' ? +5.0 : -5.0);
+                if (to < 0) to = 0.0;
+                drflac_uint64 tgt = (drflac_uint64)(to * flac->sampleRate);
                 atomic_store(&pl.seek_target, (uint_fast64_t)tgt);
                 atomic_store(&pl.seek_pending, 1);
-                atomic_store(&pl.muted, 1);   // silence until prebuffered again
+                atomic_store(&pl.muted, 1); // mute until prebuffered
             }
         }
-
-        ma_sleep(100); // ~10 fps UI
+        ma_sleep(100);
     }
-
     disable_raw();
+    puts("");
 
-    printf("\n");
-
-    /* Cleanup */
+    // Player shutdown and cleanup
     pl.running = 0;
     pthread_join(pl.th, NULL);
-
     ma_device_uninit(&pl.device);
     ring_free(&pl.rb);
     drflac_close(flac);
     return 0;
 }
-
