@@ -16,6 +16,7 @@ typedef struct {
 
 int ring_init(RingBuffer *rb, size_t frames, size_t channels);
 void ring_free(RingBuffer *rb);
+void ring_clear(RingBuffer *rb);
 size_t ring_write(RingBuffer *rb, const float *in, size_t frames);
 size_t ring_read(RingBuffer *rb, float *out, size_t frames);
 size_t ring_space(const RingBuffer *rb);

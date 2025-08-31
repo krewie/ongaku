@@ -57,3 +57,9 @@ size_t ring_read(RingBuffer *rb, float *out, size_t frames) {
   pthread_mutex_unlock(&rb->mu);
   return read;
 }
+
+void ring_clear(RingBuffer *rb) {
+  pthread_mutex_lock(&rb->mu);
+  rb->readPos = rb->writePos = rb->count = 0;
+  pthread_mutex_unlock(&rb->mu);
+}

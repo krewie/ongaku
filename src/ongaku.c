@@ -13,6 +13,26 @@
 #include <pthread.h>
 #include <time.h>
 
+#include <termios.h>
+#include <unistd.h>
+
+static struct termios g_orig;
+
+static void enable_raw(void) {
+    struct termios raw;
+    tcgetattr(STDIN_FILENO, &g_orig);
+    raw = g_orig;
+    raw.c_lflag &= ~(ICANON | ECHO);      // no line buffering, no echo
+    raw.c_cc[VMIN]  = 0;                  // non-blocking read
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+}
+
+static void disable_raw(void) {
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_orig);
+}
+
+
 typedef struct {
     drflac*       flac;         // streaming decoder
     ma_device     device;       // audio device
@@ -24,94 +44,78 @@ typedef struct {
     int           running;      // decode thread should run
     int           eof;          // source drained
     float         volume;       // 0.0 .. 1.0
+    atomic_bool   seek_pending;
+    atomic_uint_fast64_t  seek_target;
+    atomic_bool   muted;
+    size_t        prebuffer_frames;
 } Player;
 
 /* -------------------- Decode thread (producer) -------------------- */
 static void* decode_thread(void* arg) {
-    Player* pl = (Player*)arg;
-    const size_t CH = pl->rb.channels;
-    (void)CH;
+  Player* pl = (Player*)arg;
+  float temp[8192 * 8];                     // 8192 frames x up to 8ch
 
-    float temp[4096 * 8]; // 4096 frames * up to 8ch
-
-    while (pl->running) {
-        // If buffer nearly full, nap briefly.
-        if (ring_space(&pl->rb) < 1024) {
-            struct timespec ts = {0, 2 * 1000 * 1000}; // 2ms
-            nanosleep(&ts, NULL);
-            continue;
-        }
-
-        size_t want = 4096;
-        size_t space = ring_space(&pl->rb);
-        if (space < want) want = space;
-        if (want == 0) continue;
-
-        drflac_uint64 got = drflac_read_pcm_frames_f32(pl->flac, want, temp);
-        if (got == 0) { pl->eof = 1; break; }
-
-        size_t wrote = ring_write(&pl->rb, temp, (size_t)got);
-        // If wrote < got, buffer filled mid-chunk; remainder will be read next loop.
+  while (pl->running) {
+    // Handle pending seek
+    if (atomic_load(&pl->seek_pending)) {
+      drflac_uint64 tgt = (drflac_uint64)atomic_load(&pl->seek_target);
+      if (drflac_seek_to_pcm_frame(pl->flac, tgt)) {
+        ring_clear(&pl->rb);                // drop stale data
+        pl->eof = 0;
+        pl->playedFrames = tgt;
+        atomic_store(&pl->seek_pending, false);
+        // stay muted; we’ll unmute after prebuffer
+      } else {
+        atomic_store(&pl->seek_pending, false);
+        atomic_store(&pl->muted, false);    // don’t stay silent forever
+      }
     }
 
-    return NULL;
+    size_t space = ring_space(&pl->rb);
+    if (space == 0) {                       // near-full → nap a bit
+      struct timespec ts = {0, 3*1000*1000}; nanosleep(&ts, NULL);
+      continue;
+    }
+
+    size_t want = space < 8192 ? space : 8192;
+    drflac_uint64 got = drflac_read_pcm_frames_f32(pl->flac, want, temp);
+    if (got == 0) { pl->eof = 1; break; }
+
+    ring_write(&pl->rb, temp, (size_t)got);
+
+    // Prebuffer gate after seek
+    if (atomic_load(&pl->muted) && ring_available(&pl->rb) >= pl->prebuffer_frames) {
+      atomic_store(&pl->muted, false);
+    }
+  }
+  return NULL;
 }
 
 /* -------------------- Audio callback (consumer) -------------------- */
 static void data_callback(ma_device* dev, void* out, const void* in, ma_uint32 frameCount) {
-    (void)in;
-    Player* pl = (Player*)dev->pUserData;
-    float*  dst = (float*)out;
-    ma_uint32 ch = dev->playback.channels;
+  (void)in;
+  Player* pl = (Player*)dev->pUserData;
+  float*  dst = (float*)out;
+  ma_uint32 ch = dev->playback.channels;
 
-    // If paused: output silence.
-    if (atomic_load(&pl->paused)) {
-        memset(dst, 0, (size_t)frameCount * ch * sizeof(float));
-        return;
+  if (atomic_load(&pl->paused) || atomic_load(&pl->muted)) {
+    memset(dst, 0, (size_t)frameCount * ch * sizeof(float));
+    return;
+  }
+
+  size_t got = ring_read(&pl->rb, dst, frameCount);
+  pl->playedFrames += (drflac_uint64)got;
+
+  if (pl->volume != 1.0f) {
+    size_t n = got * ch; for (size_t i=0;i<n;i++) dst[i] *= pl->volume;
+  }
+
+  if (got < frameCount) {
+    memset(dst + got * ch, 0, (frameCount - got) * ch * sizeof(float));
+    if (pl->eof && ring_available(&pl->rb) == 0) {
+      atomic_store(&pl->finished, true);
     }
-
-    // Read what we can from the ring buffer.
-    size_t got = ring_read(&pl->rb, dst, frameCount);
-    pl->playedFrames += (drflac_uint64)got;
-
-    // Apply volume on the frames we got.
-    if (pl->volume != 1.0f && got > 0) {
-        size_t n = got * ch;
-        for (size_t i = 0; i < n; ++i) dst[i] *= pl->volume;
-    }
-
-    // If short, pad with silence so the device always gets frameCount frames.
-    if (got < frameCount) {
-        size_t padFrames = (size_t)frameCount - got;
-        memset(dst + got * ch, 0, padFrames * ch * sizeof(float));
-
-        // If source is drained AND buffer empty, mark finished.
-        if (pl->eof && ring_available(&pl->rb) == 0) {
-            atomic_store(&pl->finished, 1);
-        }
-    }
-}
-
-/* -------------------- Optional: precise seek helper -------------------- */
-void ongaku_seek(Player* pl, double seconds) {
-    drflac_uint64 target = (drflac_uint64)(seconds * pl->flac->sampleRate);
-    if (target > pl->flac->totalPCMFrameCount) target = pl->flac->totalPCMFrameCount;
-
-    // Stop feeding new data while we reposition.
-    // In a fuller app you'd pause device and/or lock rb; for this demo it's fine.
-    if (!drflac_seek_to_pcm_frame(pl->flac, target)) {
-        fprintf(stderr, "Seek failed!\n");
-        return;
-    }
-
-    // Flush ring so we don't play old samples.
-    // Simple approach: clear counters (requires a clear helper or re-init).
-    // If your ringbuffer has no clear(), do this:
-    ring_free(&pl->rb);
-    ring_init(&pl->rb, pl->device.sampleRate * 2, pl->device.playback.channels);
-
-    pl->playedFrames = target;
-    pl->eof = 0; // we can read again
+  }
 }
 
 /* -------------------- Main -------------------- */
@@ -119,6 +123,15 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s song.flac [volume 0.0-1.0]\n", argv[0]);
         return 1;
+    }
+    int isHelp = strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0;
+    if (argc == 2 && isHelp) {
+        printf("Usage: %s song.flac [volume 0.0-1.0]\n", argv[0]);
+        printf("Shortcuts: \n");
+        printf("j: seek -5s\n");
+        printf("k: play/pause\n");
+        printf("l:, seek +5s\n");
+        return 0;
     }
 
     const char* path  = argv[1];
@@ -144,12 +157,14 @@ int main(int argc, char** argv) {
     Player pl = {0};
     pl.flac   = flac;
     pl.volume = (volume < 0.f) ? 0.f : (volume > 1.f ? 1.f : volume);
-    atomic_init(&pl.finished, 0);
-    atomic_init(&pl.paused,   0);
+    atomic_init(&pl.finished,      0);
+    atomic_init(&pl.paused,        0);
+    atomic_init(&pl.seek_pending,  0);
+    atomic_init(&pl.muted,         0);
     pl.running = 1;
     pl.eof     = 0;
 
-    /* Configure device to match the file (or force 48000 and resample if you add a resampler) */
+    /* Configure + init device */
     ma_device_config cfg = ma_device_config_init(ma_device_type_playback);
     cfg.playback.format   = ma_format_f32;
     cfg.playback.channels = (ma_uint32)flac->channels;
@@ -181,6 +196,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    /* Prefill before starting audio (and mute while filling) */
+    atomic_store(&pl.muted, 1);
+    while (ring_available(&pl.rb) < pl.prebuffer_frames) {
+        struct timespec ts = {0, 3*1000*1000}; // 3 ms
+        nanosleep(&ts, NULL);
+    }
+    atomic_store(&pl.muted, 0);
+
     if (ma_device_start(&pl.device) != MA_SUCCESS) {
         fprintf(stderr, "Failed to start device.\n");
         pl.running = 0;
@@ -192,19 +215,45 @@ int main(int argc, char** argv) {
     }
 
     /* Simple wait loop with elapsed time */
-    while (!atomic_load(&pl.finished)) {
-        double elapsed = (double)pl.playedFrames / flac->sampleRate;
-        size_t avail = ring_available(&pl.rb);
-        double secondsBuffered = (double) avail / flac->sampleRate;
+    enable_raw();
 
-        printf("\rElapsed: %02d:%02d Buffer: %.1f sec (%zu frames)", 
-               (int)(elapsed/60), 
-               (int)elapsed % 60,
-               secondsBuffered,
-               avail);
+    while (!atomic_load(&pl.finished)) {
+        // print status
+        double elapsed = (double)pl.playedFrames / flac->sampleRate;
+        size_t avail   = ring_available(&pl.rb);
+        double pct     = 100.0 * (double)avail / (double)pl.rb.capacity;
+
+        printf("\r%02d:%02d  Buf:%5.1f%%  %s",
+               (int)(elapsed/60), (int)elapsed % 60,
+               pct,
+               atomic_load(&pl.paused) ? "[PAUSED]" :
+               (atomic_load(&pl.muted) ? "[SEEK]" : "      "));
         fflush(stdout);
-        ma_sleep(250);
+
+        // non-blocking key read
+        char c;
+        if (read(STDIN_FILENO, &c, 1) == 1) {
+            if (c == 'q') break;             // quit
+            if (c == 'k') {                  // toggle pause
+                int p = atomic_load(&pl.paused);
+                atomic_store(&pl.paused, !p);
+            }
+            if (c == 'j' || c == 'l') {      // seek -/+ 5s
+                double nowSec = (double)pl.playedFrames / pl.flac->sampleRate;
+                double toSec  = nowSec + (c=='l' ? +5.0 : -5.0);
+                if (toSec < 0) toSec = 0.0;
+                drflac_uint64 tgt = (drflac_uint64)(toSec * pl.flac->sampleRate);
+                atomic_store(&pl.seek_target, (uint_fast64_t)tgt);
+                atomic_store(&pl.seek_pending, 1);
+                atomic_store(&pl.muted, 1);   // silence until prebuffered again
+            }
+        }
+
+        ma_sleep(100); // ~10 fps UI
     }
+
+    disable_raw();
+
     printf("\n");
 
     /* Cleanup */
