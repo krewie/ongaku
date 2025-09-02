@@ -191,7 +191,7 @@ int ongaku_play(const char* path, float volume) {
         printf("\r%02d:%02d  Buf:%5.1f%%\tVol: %5.2f\t%s",
             (int)(elapsed/60), (int)elapsed % 60, pct, pl.volume,
             atomic_load(&pl.paused) ? "[PAUSED]" :
-            (atomic_load(&pl.muted)  ? "[SEEK]"   : "      "));
+            (atomic_load(&pl.muted)  ? "[SEEK]"   : "[PLAY]"));
         fflush(stdout);
 
         char c;
